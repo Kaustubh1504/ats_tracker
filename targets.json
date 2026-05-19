@@ -1,0 +1,40 @@
+{
+  "_comment": "Companies for the live ATS scrape. One API call per cycle per entry. ats must be a jobhive scraper id (greenhouse, lever, ashby, smartrecruiters, workable, rippling, personio, gem, joincom, icims, jazzhr, breezy, teamtailor, pinpoint, bamboohr, cornerstone, recruitee, recruiterbox, eightfold, avature, phenom, workday, oracle, successfactors, taleo, mercor, amazon, apple, google, tiktok, uber, meta, tesla). For big-tech endpoints the slug is ignored but must be present.",
+
+  "targets": [
+    { "ats": "greenhouse", "slug": "anthropic" },
+    { "ats": "greenhouse", "slug": "stripe" },
+    { "ats": "greenhouse", "slug": "airbnb" },
+    { "ats": "greenhouse", "slug": "databricks" },
+    { "ats": "greenhouse", "slug": "discord" },
+    { "ats": "greenhouse", "slug": "figma" },
+    { "ats": "greenhouse", "slug": "coinbase" },
+    { "ats": "greenhouse", "slug": "robinhood" },
+    { "ats": "greenhouse", "slug": "duolingo" },
+    { "ats": "greenhouse", "slug": "doordash" },
+    { "ats": "greenhouse", "slug": "instacart" },
+    { "ats": "greenhouse", "slug": "samsara" },
+
+    { "ats": "ashby", "slug": "openai" },
+    { "ats": "ashby", "slug": "notion" },
+    { "ats": "ashby", "slug": "linear" },
+    { "ats": "ashby", "slug": "ramp" },
+    { "ats": "ashby", "slug": "vercel" },
+    { "ats": "ashby", "slug": "supabase" },
+    { "ats": "ashby", "slug": "perplexity" },
+    { "ats": "ashby", "slug": "huggingface" },
+    { "ats": "ashby", "slug": "scaleai" },
+    { "ats": "ashby", "slug": "cohere" },
+
+    { "ats": "lever", "slug": "palantir" },
+    { "ats": "lever", "slug": "netflix" },
+    { "ats": "lever", "slug": "shopify" },
+    { "ats": "lever", "slug": "plaid" },
+
+    { "ats": "amazon", "slug": "amazon" },
+    { "ats": "apple",  "slug": "apple"  },
+    { "ats": "google", "slug": "google" },
+    { "ats": "uber",   "slug": "uber"   },
+    { "ats": "tiktok", "slug": "tiktok" }
+  ]
+}

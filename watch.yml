@@ -1,0 +1,79 @@
+name: Summer 2027 watcher
+
+on:
+  schedule:
+    # Live scrape every 15 minutes
+    - cron: "*/15 * * * *"
+    # Dataset sweep once a day at 09:00 UTC
+    - cron: "0 9 * * *"
+  workflow_dispatch:   # Manual trigger from the Actions tab
+
+# Serialize runs so they don't race on git push.
+# cancel-in-progress: false means new runs queue, they don't kill the running one.
+concurrency:
+  group: watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # needed to commit data/seen.csv back
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Default token has push rights when contents: write is set.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # We pull --rebase below, so fetch enough history to do that cleanly.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pull latest (in case the other schedule pushed during our queue)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash origin "${{ github.ref_name }}" || true
+
+      - name: Run watcher
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SEEN_CSV: data/seen.csv
+        run: |
+          # 09:00 UTC schedule → dataset sweep.
+          # Every other schedule trigger → live scrape.
+          # Manual run → both passes.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python watcher.py --once
+          elif [ "${{ github.event.schedule }}" = "0 9 * * *" ]; then
+            python watcher.py --once-dataset
+          else
+            python watcher.py --once-live
+          fi
+
+      - name: Commit and push dedupe CSV
+        run: |
+          if [ -n "$(git status --porcelain data/seen.csv)" ]; then
+            git add data/seen.csv
+            git commit -m "watcher: update seen.csv ($(date -u +%Y-%m-%dT%H:%MZ))"
+            # Retry once if a concurrent push beat us to it.
+            for i in 1 2 3; do
+              if git push; then exit 0; fi
+              echo "push failed, pulling and retrying ($i/3)…"
+              git pull --rebase --autostash origin "${{ github.ref_name }}"
+              sleep $((i * 2))
+            done
+            echo "push failed after retries"; exit 1
+          else
+            echo "No changes to seen.csv"
+          fi

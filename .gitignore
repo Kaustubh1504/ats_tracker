@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# NOTE: data/seen.csv is intentionally tracked — it's the dedupe store.

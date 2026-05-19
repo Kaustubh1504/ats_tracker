@@ -1,0 +1,70 @@
+{
+  "_comment": "Search and filter config. dataset_queries are fed verbatim to jobhive.search(). title_patterns are Python regex — a job's TITLE must match at least one. intern_patterns and year_patterns are checked against title + description combined. Remember to escape backslashes in JSON (\\b, not \\b).",
+
+  "dataset_queries": [
+    "software engineer intern 2027",
+    "software engineering intern 2027",
+    "swe intern summer 2027",
+    "backend intern 2027",
+    "frontend intern 2027",
+    "full stack intern 2027",
+    "platform engineer intern 2027",
+    "systems engineer intern 2027",
+    "site reliability intern 2027",
+    "devops intern 2027",
+
+    "machine learning intern 2027",
+    "ml intern summer 2027",
+    "ai intern 2027",
+    "applied ai intern 2027",
+    "applied scientist intern 2027",
+    "research scientist intern 2027",
+    "deep learning intern 2027",
+    "ai research intern 2027",
+    "computer vision intern 2027",
+    "nlp intern 2027",
+    "data scientist intern 2027",
+
+    "cloud engineer intern 2027",
+    "cloud infrastructure intern 2027",
+    "infrastructure intern 2027",
+
+    "network engineer intern 2027",
+    "networking intern 2027",
+    "distributed systems intern 2027"
+  ],
+
+  "title_patterns": [
+    "\\bsoftware\\b",
+    "\\bswe\\b",
+    "\\bweb\\b",
+    "\\bbackend\\b",
+    "\\bfront[- ]?end\\b",
+    "\\bfull[- ]?stack\\b",
+    "\\bplatform\\b",
+    "\\bsystems?\\b",
+    "\\bsite reliability\\b|\\bsre\\b",
+    "\\bdevops\\b",
+    "\\binfrastructure\\b",
+    "\\bcloud\\b",
+    "\\bnetwork(ing)?\\b",
+    "\\bdistributed\\b",
+    "\\bmachine learning\\b|\\bml\\b",
+    "\\b(applied )?ai\\b|\\bartificial intelligence\\b",
+    "\\bdeep learning\\b",
+    "\\bcomputer vision\\b|\\bcv\\b",
+    "\\bnlp\\b|\\bnatural language\\b",
+    "\\bresearch (scientist|engineer)\\b",
+    "\\bapplied scientist\\b",
+    "\\bdata (scientist|engineer)\\b",
+    "\\bllm\\b|\\bgenerative ai\\b|\\bgen ?ai\\b",
+    "\\bperception\\b|\\brobotics\\b",
+    "\\bsecurity engineer(ing)?\\b"
+  ],
+
+  "intern_patterns": ["\\b(intern|internship|co[- ]?op)\\b"],
+
+  "year_patterns": ["\\b2027\\b", "\\bsummer ?'?27\\b", "\\bsu ?27\\b"],
+
+  "country": "US"
+}
