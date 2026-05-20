@@ -1,5 +1,6 @@
 """
-Summer 2027 internship watcher — CSV-backed dedupe, GitHub-Actions-friendly.
+Internship watcher — writes new postings to Supabase, sends a single Discord +
+email summary per run.
 
   • Live scrape (--once-live):
       Hits ATS APIs directly for the companies in config/targets.json.
@@ -7,25 +8,24 @@ Summer 2027 internship watcher — CSV-backed dedupe, GitHub-Actions-friendly.
   • Dataset sweep (--once-dataset):
       Runs jobhive.search() across the queries in config/roles.json.
 
-  • Default (no args):
-      Long-running APScheduler: live every LIVE_POLL_MINUTES, dataset every
-      DATASET_POLL_HOURS. Useful for always-on hosts. GitHub Actions should
-      use --once-live or --once-dataset and let cron drive the cadence.
-
-Dedupe lives in data/seen.csv. Loaded on startup, appended to on every new
-post. Commit it back to the repo so each Actions run starts where the last
-one ended.
+Dedupe is dual-tracked: an in-memory CSV (data/seen.csv) for cheap re-run
+gating, and Supabase's unique constraint on global_id for the actual storage.
 
 Required env
 ------------
-    DISCORD_WEBHOOK_URL   Discord webhook URL
+    SUPABASE_URL          https://<project>.supabase.co
+    SUPABASE_KEY          anon/publishable key (RLS policies allow anon writes)
 
 Optional env
 ------------
-    CONFIG_DIR            Directory containing targets.json + roles.json
-                          (default: ./config)
+    DISCORD_WEBHOOK_URL   Webhook for the per-run summary ping
+    RESEND_API_KEY        Resend API key (for the per-run email summary)
+    NOTIFY_EMAIL          Where to send the run summary email
+    NOTIFY_FROM_EMAIL     'From' address (default: onboarding@resend.dev)
+    WEBAPP_URL            Link to the webapp, included in summary messages
+    CONFIG_DIR            Directory containing targets.json + roles.json (default: ./config)
     SEEN_CSV              Path to dedupe CSV (default: ./data/seen.csv)
-    LIVE_POLL_MINUTES     Live scrape interval  (default: 15)
+    LIVE_POLL_MINUTES     Live scrape interval  (default: 60)
     DATASET_POLL_HOURS    Dataset sweep interval (default: 24)
 """
 
@@ -40,6 +40,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,17 +55,30 @@ try:
 except ImportError:
     sys.exit("jobhive is not installed. Run: pip install 'jobhive-py[parquet,scrapers]'")
 
+try:
+    from supabase import create_client, Client
+except ImportError:
+    sys.exit("supabase client not installed. Run: pip install supabase")
+
 
 # =========================================================================== #
 # Config
 # =========================================================================== #
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL")
+NOTIFY_FROM_EMAIL = os.environ.get("NOTIFY_FROM_EMAIL", "onboarding@resend.dev")
+WEBAPP_URL = os.environ.get("WEBAPP_URL")
+
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "config"))
 SEEN_CSV = Path(os.environ.get("SEEN_CSV", "data/seen.csv"))
-LIVE_POLL_MINUTES = int(os.environ.get("LIVE_POLL_MINUTES", "15"))
+LIVE_POLL_MINUTES = int(os.environ.get("LIVE_POLL_MINUTES", "60"))
 DATASET_POLL_HOURS = int(os.environ.get("DATASET_POLL_HOURS", "24"))
-POST_DELAY_SEC = 1.0
+SCRAPE_WORKERS = int(os.environ.get("SCRAPE_WORKERS", "8"))
+SCRAPE_TIMEOUT_SEC = float(os.environ.get("SCRAPE_TIMEOUT_SEC", "120"))
 
 CSV_COLUMNS = ["global_id", "company", "title", "location", "source", "posted_at", "first_seen"]
 
@@ -81,7 +95,7 @@ class Config:
     dataset_queries: list[str]
     title_re: re.Pattern
     intern_re: re.Pattern
-    year_re: re.Pattern
+    title_block_re: re.Pattern | None
     country: str
 
 
@@ -115,12 +129,20 @@ def load_config(config_dir: Path) -> Config:
         except re.error as e:
             sys.exit(f"roles.json: bad regex in {name}: {e}")
 
+    block_patterns = roles_doc.get("title_block_patterns") or []
+    title_block_re = None
+    if block_patterns:
+        try:
+            title_block_re = re.compile("|".join(block_patterns), re.IGNORECASE)
+        except re.error as e:
+            sys.exit(f"roles.json: bad regex in title_block_patterns: {e}")
+
     return Config(
         targets=targets,
         dataset_queries=list(roles_doc.get("dataset_queries") or []),
         title_re=_compile(roles_doc.get("title_patterns") or [], "title_patterns"),
         intern_re=_compile(roles_doc.get("intern_patterns") or [], "intern_patterns"),
-        year_re=_compile(roles_doc.get("year_patterns") or [], "year_patterns"),
+        title_block_re=title_block_re,
         country=(roles_doc.get("country") or "US").strip().upper(),
     )
 
@@ -140,7 +162,55 @@ ds_log = logging.getLogger("watcher.dataset")
 
 
 # =========================================================================== #
-# CSV dedupe store
+# Supabase
+# =========================================================================== #
+
+def get_supabase() -> Client | None:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.warning("SUPABASE_URL / SUPABASE_KEY not set — Supabase writes disabled.")
+        return None
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        log.error("Failed to init Supabase client: %s", e)
+        return None
+
+
+def _truncate(value, limit: int) -> str | None:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    return s[:limit]
+
+
+def write_to_supabase(sb: Client, row: dict, source: str) -> bool:
+    gid = (row.get("global_id") or "").strip()
+    if not gid:
+        return False
+
+    payload = {
+        "global_id": gid,
+        "company": _truncate(row.get("company"), 200) or "Unknown",
+        "title": _truncate(row.get("title"), 300) or "Untitled",
+        "location": _truncate(row.get("location"), 200),
+        "apply_url": _truncate(row.get("apply_url") or row.get("url"), 1000),
+        "description": _truncate(row.get("description"), 8000),
+        "source": source,
+        "ats_type": _truncate(row.get("ats_type"), 80),
+        "is_remote": bool(row["is_remote"]) if row.get("is_remote") is not None else None,
+        "salary_summary": _truncate(row.get("salary_summary"), 200),
+        "posted_at": _truncate(row.get("posted_at"), 80),
+    }
+    try:
+        sb.table("jobs").upsert(payload, on_conflict="global_id").execute()
+        return True
+    except Exception as e:
+        log.warning("Supabase upsert failed for %s: %s", gid, e)
+        return False
+
+
+# =========================================================================== #
+# CSV dedupe store (belt-and-suspenders alongside Supabase's unique constraint)
 # =========================================================================== #
 
 class SeenStore:
@@ -154,7 +224,6 @@ class SeenStore:
     def _load(self) -> None:
         if not self.path.exists():
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            # Write header so subsequent appends don't need to check.
             with self.path.open("w", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, fieldnames=CSV_COLUMNS).writeheader()
             log.info("Created new dedupe CSV at %s", self.path)
@@ -210,13 +279,23 @@ def job_to_dict(job) -> dict:
 # Filtering
 # =========================================================================== #
 
-US_LOCATION_MARKERS = (
-    "united states", "usa", " u.s.", " us ", ", us",
-    " ca", " ny", " wa", " tx", " ma", " il", " co", " ga", " fl",
-    "california", "new york", "seattle", "san francisco", "bay area",
-    "boston", "austin", "chicago", "atlanta", "denver",
-    "remote - us", "remote, us", "remote (us)", "us remote",
+US_EXPLICIT_MARKERS = (
+    "united states", "usa", "u.s.a", "u.s.",
+    ", us", "remote - us", "remote, us", "remote (us)", "us remote",
 )
+
+US_CITY_MARKERS = (
+    "new york", "san francisco", "los angeles", "seattle", "boston",
+    "austin", "chicago", "atlanta", "denver", "bay area",
+    "silicon valley", "washington d.c.", "washington, dc",
+)
+
+_US_STATE_CODES = (
+    "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN "
+    "MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA "
+    "WA WV WI WY DC"
+).split()
+US_STATE_RE = re.compile(r",\s*(" + "|".join(_US_STATE_CODES) + r")\b", re.IGNORECASE)
 
 
 def is_in_country(row: dict, country: str) -> bool:
@@ -227,86 +306,137 @@ def is_in_country(row: dict, country: str) -> bool:
         return False
     if country != "US":
         return True
-    loc = (row.get("location") or "").lower()
-    return any(m in loc for m in US_LOCATION_MARKERS) if loc else False
+    loc = row.get("location") or ""
+    if not loc:
+        return False
+    loc_lower = loc.lower()
+    if any(m in loc_lower for m in US_EXPLICIT_MARKERS):
+        return True
+    if any(m in loc_lower for m in US_CITY_MARKERS):
+        return True
+    return bool(US_STATE_RE.search(loc))
 
 
-def matches_role(row: dict, cfg: Config) -> bool:
+def matches_role(row: dict, cfg: Config) -> str:
     title = str(row.get("title") or "")
     desc = str(row.get("description") or "")
     blob = f"{title}\n{desc}"
 
     if not cfg.intern_re.search(blob):
-        return False
-    if not cfg.year_re.search(blob):
-        return False
+        return "no_intern"
+    if cfg.title_block_re is not None and cfg.title_block_re.search(title):
+        return "blocked"
     if cfg.title_re.search(title):
-        return True
+        return "ok"
     if re.search(r"\bintern\b", title, re.IGNORECASE) and cfg.title_re.search(desc):
-        return True
-    return False
+        return "ok"
+    return "no_title"
 
 
 # =========================================================================== #
-# Discord
+# Notifications — sent once per run, only if there are new jobs
 # =========================================================================== #
 
-def build_embed(row: dict, source: str) -> dict:
-    title = (row.get("title") or "Untitled role")[:250]
-    company = row.get("company") or "Unknown company"
-    url = row.get("apply_url") or row.get("url") or ""
+def send_discord_summary(source: str, new_rows: list[dict]) -> None:
+    if not WEBHOOK_URL or not new_rows:
+        return
 
-    fields = []
-    if row.get("location"):
-        fields.append({"name": "Location", "value": str(row["location"])[:1000], "inline": True})
-    if row.get("is_remote"):
-        fields.append({"name": "Remote", "value": "Yes", "inline": True})
-    if row.get("salary_summary"):
-        fields.append({"name": "Salary", "value": str(row["salary_summary"])[:1000], "inline": True})
-    elif row.get("salary_min") or row.get("salary_max"):
-        s_min = row.get("salary_min") or "?"
-        s_max = row.get("salary_max") or "?"
-        cur = row.get("salary_currency") or ""
-        fields.append({"name": "Salary", "value": f"{s_min}–{s_max} {cur}".strip(), "inline": True})
-    if row.get("ats_type"):
-        fields.append({"name": "ATS", "value": str(row["ats_type"]), "inline": True})
-    fields.append({"name": "Source", "value": source, "inline": True})
+    count = len(new_rows)
+    preview_lines = []
+    for r in new_rows[:10]:
+        title = (r.get("title") or "Untitled")[:80]
+        company = r.get("company") or "?"
+        url = str(r.get("apply_url") or r.get("url") or "")
+        if url:
+            preview_lines.append(f"• [**{title}**]({url}) — {company}")
+        else:
+            preview_lines.append(f"• **{title}** — {company}")
+    if count > 10:
+        preview_lines.append(f"…and {count - 10} more")
+    preview = "\n".join(preview_lines)
 
-    desc_src = str(row.get("description") or "")
-    if len(desc_src) > 400:
-        desc_src = desc_src[:400].rsplit(" ", 1)[0] + "…"
-
-    return {
-        "title": f"{title} — {company}",
-        "url": url,
-        "description": desc_src or None,
-        "fields": fields,
+    embed = {
+        "title": f"🆕 {count} new internship{'s' if count != 1 else ''} ({source})",
+        "description": preview,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if WEBAPP_URL:
+        embed["url"] = WEBAPP_URL
 
-
-def post_to_discord(row: dict, source: str) -> bool:
-    if not WEBHOOK_URL:
-        log.error("DISCORD_WEBHOOK_URL is not set; cannot post.")
-        return False
-
-    payload = {"embeds": [build_embed(row, source)]}
     try:
-        r = requests.post(WEBHOOK_URL, json=payload, timeout=15)
+        r = requests.post(WEBHOOK_URL, json={"embeds": [embed]}, timeout=15)
+        if not r.ok:
+            log.warning("Discord summary %s: %s", r.status_code, r.text[:200])
     except requests.RequestException as e:
-        log.warning("Discord POST failed: %s", e)
-        return False
+        log.warning("Discord summary POST failed: %s", e)
 
-    if r.status_code == 429:
-        wait = float(r.json().get("retry_after", 2))
-        log.info("Rate limited; sleeping %.1fs", wait)
-        time.sleep(wait)
-        return post_to_discord(row, source)
 
-    if not r.ok:
-        log.warning("Discord %s: %s", r.status_code, r.text[:200])
-        return False
-    return True
+def send_email_summary(source: str, new_rows: list[dict]) -> None:
+    if not RESEND_API_KEY or not NOTIFY_EMAIL or not new_rows:
+        return
+
+    count = len(new_rows)
+    rows_html = []
+    for r in new_rows[:50]:
+        company = (r.get("company") or "?")[:60]
+        title = (r.get("title") or "Untitled")[:120]
+        location = (r.get("location") or "")[:80]
+        url = str(r.get("apply_url") or r.get("url") or "")
+        title_cell = f'<a href="{url}" style="color:#2563eb;text-decoration:none">{title}</a>' if url else title
+        rows_html.append(
+            f'<tr>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #eee;font-weight:500">{company}</td>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #eee">{title_cell}</td>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #eee;color:#666;font-size:13px">{location}</td>'
+            f'</tr>'
+        )
+    extra = f"<p style='color:#666;font-size:13px'>…and {count - 50} more (open the dashboard)</p>" if count > 50 else ""
+    dashboard_link = f'<p><a href="{WEBAPP_URL}" style="color:#2563eb">Open dashboard →</a></p>' if WEBAPP_URL else ""
+
+    body_html = f"""
+    <div style="font-family:-apple-system,system-ui,sans-serif;max-width:720px;margin:0 auto">
+      <h2 style="margin-bottom:4px">{count} new internship{'s' if count != 1 else ''}</h2>
+      <p style="color:#666;margin-top:0">source: <code>{source}</code></p>
+      {dashboard_link}
+      <table style="border-collapse:collapse;width:100%;margin-top:12px;font-size:14px">
+        <thead>
+          <tr style="background:#f5f5f7">
+            <th style="padding:8px 10px;text-align:left;border-bottom:2px solid #ddd">Company</th>
+            <th style="padding:8px 10px;text-align:left;border-bottom:2px solid #ddd">Title</th>
+            <th style="padding:8px 10px;text-align:left;border-bottom:2px solid #ddd">Location</th>
+          </tr>
+        </thead>
+        <tbody>
+          {''.join(rows_html)}
+        </tbody>
+      </table>
+      {extra}
+    </div>
+    """
+
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+            json={
+                "from": NOTIFY_FROM_EMAIL,
+                "to": [NOTIFY_EMAIL],
+                "subject": f"[ATS] {count} new — {source}",
+                "html": body_html,
+            },
+            timeout=15,
+        )
+        if not r.ok:
+            log.warning("Resend %s: %s", r.status_code, r.text[:200])
+    except requests.RequestException as e:
+        log.warning("Email summary failed: %s", e)
+
+
+def send_run_summary(source: str, new_rows: list[dict]) -> None:
+    if not new_rows:
+        return
+    send_discord_summary(source, new_rows)
+    send_email_summary(source, new_rows)
 
 
 # =========================================================================== #
@@ -318,59 +448,95 @@ def process_rows(
     source: str,
     seen: SeenStore,
     cfg: Config,
-) -> tuple[int, int, int, int]:
-    posted = skipped_seen = skipped_country = skipped_match = 0
+    sb: Client | None,
+) -> tuple[dict, list[dict]]:
+    counts = {"posted": 0, "seen": 0, "non_country": 0,
+              "no_intern": 0, "blocked": 0, "no_title": 0}
+    new_rows: list[dict] = []
+
     for row in rows:
         gid = row.get("global_id")
         if not gid:
             continue
         if gid in seen:
-            skipped_seen += 1
+            counts["seen"] += 1
             continue
         if not is_in_country(row, cfg.country):
-            skipped_country += 1
+            counts["non_country"] += 1
             continue
-        if not matches_role(row, cfg):
-            skipped_match += 1
+        reason = matches_role(row, cfg)
+        if reason != "ok":
+            counts[reason] += 1
             continue
 
-        if post_to_discord(row, source):
-            seen.add(row, source)
-            posted += 1
-            time.sleep(POST_DELAY_SEC)
-    return posted, skipped_seen, skipped_country, skipped_match
+        if sb is not None and not write_to_supabase(sb, row, source):
+            continue
+
+        seen.add(row, source)
+        new_rows.append(row)
+        counts["posted"] += 1
+
+    return counts, new_rows
 
 
 # =========================================================================== #
 # Modes
 # =========================================================================== #
 
-def live_check(cfg: Config, seen: SeenStore) -> None:
-    live_log.info("Live scrape of %d targets…", len(cfg.targets))
-    rows: list[dict] = []
-    for t in cfg.targets:
+def _fetch_one_target(t: Target) -> tuple[Target, list[dict], Exception | None, float]:
+    """Fetch a single target. Runs inside a worker thread."""
+    start = time.monotonic()
+    try:
+        jobs = get_scraper(t.ats, t.slug).fetch()
+    except Exception as e:
+        return (t, [], e, time.monotonic() - start)
+    out: list[dict] = []
+    for job in jobs or []:
         try:
-            jobs = get_scraper(t.ats, t.slug).fetch()
-        except Exception as e:
-            live_log.warning("%s/%s scraper failed: %s", t.ats, t.slug, e)
-            continue
-        for job in jobs or []:
+            out.append(job_to_dict(job))
+        except TypeError:
+            pass
+    return (t, out, None, time.monotonic() - start)
+
+
+def live_check(cfg: Config, seen: SeenStore, sb: Client | None) -> None:
+    live_log.info("Live scrape of %d targets (workers=%d)…", len(cfg.targets), SCRAPE_WORKERS)
+    rows: list[dict] = []
+    failed = 0
+    started = time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=SCRAPE_WORKERS) as ex:
+        futures = {ex.submit(_fetch_one_target, t): t for t in cfg.targets}
+        for fut in as_completed(futures):
+            t = futures[fut]
             try:
-                rows.append(job_to_dict(job))
-            except TypeError as e:
-                live_log.warning("Unconvertible job from %s/%s: %s", t.ats, t.slug, e)
-        # Gentle stagger to avoid looking botty to any single ATS host.
-        time.sleep(1.0)
+                _, target_rows, err, elapsed = fut.result(timeout=SCRAPE_TIMEOUT_SEC)
+            except Exception as e:
+                live_log.warning("%s/%s timed out or crashed: %s", t.ats, t.slug, e)
+                failed += 1
+                continue
+            if err is not None:
+                live_log.warning("%s/%s scraper failed in %.1fs: %s", t.ats, t.slug, elapsed, err)
+                failed += 1
+                continue
+            rows.extend(target_rows)
+            if elapsed > 30:
+                live_log.info("%s/%s slow: %.1fs, %d jobs", t.ats, t.slug, elapsed, len(target_rows))
 
-    live_log.info("Collected %d candidate rows", len(rows))
-    posted, s_seen, s_country, s_match = process_rows(rows, "live", seen, cfg)
     live_log.info(
-        "Posted %d new role(s)  (seen=%d, non-%s=%d, no-match=%d)",
-        posted, s_seen, cfg.country, s_country, s_match,
+        "Collected %d candidate rows from %d targets (%d failed) in %.1fs",
+        len(rows), len(cfg.targets) - failed, failed, time.monotonic() - started,
     )
+    c, new_rows = process_rows(rows, "live", seen, cfg, sb)
+    live_log.info(
+        "Posted %d  (seen=%d, non-%s=%d, no_intern=%d, blocked=%d, no_title=%d)",
+        c["posted"], c["seen"], cfg.country, c["non_country"],
+        c["no_intern"], c["blocked"], c["no_title"],
+    )
+    send_run_summary("live", new_rows)
 
 
-def dataset_check(cfg: Config, seen: SeenStore) -> None:
+def dataset_check(cfg: Config, seen: SeenStore, sb: Client | None) -> None:
     ds_log.info("Dataset sweep across %d queries…", len(cfg.dataset_queries))
     location_hint = "United States" if cfg.country == "US" else None
     by_id: dict[str, dict] = {}
@@ -391,13 +557,13 @@ def dataset_check(cfg: Config, seen: SeenStore) -> None:
                 by_id.setdefault(gid, row)
 
     ds_log.info("Collected %d unique candidate rows", len(by_id))
-    posted, s_seen, s_country, s_match = process_rows(
-        list(by_id.values()), "dataset", seen, cfg
-    )
+    c, new_rows = process_rows(list(by_id.values()), "dataset", seen, cfg, sb)
     ds_log.info(
-        "Posted %d new role(s)  (seen=%d, non-%s=%d, no-match=%d)",
-        posted, s_seen, cfg.country, s_country, s_match,
+        "Posted %d  (seen=%d, non-%s=%d, no_intern=%d, blocked=%d, no_title=%d)",
+        c["posted"], c["seen"], cfg.country, c["non_country"],
+        c["no_intern"], c["blocked"], c["no_title"],
     )
+    send_run_summary("dataset", new_rows)
 
 
 # =========================================================================== #
@@ -411,31 +577,31 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="Both passes once, then exit")
     args = parser.parse_args()
 
-    if not WEBHOOK_URL:
-        log.warning("DISCORD_WEBHOOK_URL is not set — matches will be logged but not posted.")
-
     cfg = load_config(CONFIG_DIR)
     seen = SeenStore(SEEN_CSV)
+    sb = get_supabase()
     log.info(
-        "Config: %d targets, %d dataset queries, country=%s, %d previously seen",
+        "Config: %d targets, %d queries, country=%s, seen=%d, supabase=%s, discord=%s, email=%s",
         len(cfg.targets), len(cfg.dataset_queries), cfg.country, len(seen._ids),
+        "on" if sb else "off",
+        "on" if WEBHOOK_URL else "off",
+        "on" if (RESEND_API_KEY and NOTIFY_EMAIL) else "off",
     )
 
     if args.once_live:
-        live_check(cfg, seen); return
+        live_check(cfg, seen, sb); return
     if args.once_dataset:
-        dataset_check(cfg, seen); return
+        dataset_check(cfg, seen, sb); return
     if args.once:
-        live_check(cfg, seen); dataset_check(cfg, seen); return
+        live_check(cfg, seen, sb); dataset_check(cfg, seen, sb); return
 
-    # Long-running mode: both immediately, then on schedule.
-    live_check(cfg, seen)
-    dataset_check(cfg, seen)
+    live_check(cfg, seen, sb)
+    dataset_check(cfg, seen, sb)
 
     scheduler = BlockingScheduler(timezone="UTC")
-    scheduler.add_job(lambda: live_check(cfg, seen),    "interval",
+    scheduler.add_job(lambda: live_check(cfg, seen, sb),    "interval",
                       minutes=LIVE_POLL_MINUTES,  max_instances=1, id="live")
-    scheduler.add_job(lambda: dataset_check(cfg, seen), "interval",
+    scheduler.add_job(lambda: dataset_check(cfg, seen, sb), "interval",
                       hours=DATASET_POLL_HOURS,   max_instances=1, id="dataset")
     log.info(
         "Scheduler started — live every %d min, dataset every %d h. Ctrl-C to quit.",

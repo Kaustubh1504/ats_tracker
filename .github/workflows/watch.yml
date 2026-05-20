@@ -2,8 +2,8 @@ name: Summer 2027 watcher
 
 on:
   schedule:
-    # Live scrape every 15 minutes
-    - cron: "*/15 * * * *"
+    # Live scrape every hour
+    - cron: "0 * * * *"
     # Dataset sweep once a day at 09:00 UTC
     - cron: "0 9 * * *"
   workflow_dispatch:   # Manual trigger from the Actions tab
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: write   # needed to commit data/seen.csv back
 
@@ -47,7 +47,13 @@ jobs:
 
       - name: Run watcher
         env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          NOTIFY_FROM_EMAIL: ${{ secrets.NOTIFY_FROM_EMAIL }}
+          WEBAPP_URL: ${{ secrets.WEBAPP_URL }}
           SEEN_CSV: data/seen.csv
         run: |
           # 09:00 UTC schedule → dataset sweep.

@@ -1,3 +1,4 @@
-jobhive-py[parquet,scrapers]>=0.1.0
-apscheduler>=3.10
-requests>=2.31
+jobhive-py[parquet,scrapers] @ git+https://github.com/kalil0321/ats-scrapers.git@main
+apscheduler
+requests
+supabase
