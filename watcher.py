@@ -244,14 +244,45 @@ def write_to_supabase(sb: Client, row: dict, source: str) -> bool:
 # =========================================================================== #
 
 class SeenStore:
-    """In-memory set of global_ids backed by an append-only CSV."""
+    """In-memory set of global_ids. Source of truth is the Supabase `jobs`
+    table; the CSV is an append-only offline cache used when Supabase is
+    unreachable at startup."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, sb: "Client | None" = None):
         self.path = path
         self._ids: set[str] = set()
-        self._load()
+        if sb is not None:
+            self._load_from_supabase(sb)
+        # CSV always merges in too — covers pre-Supabase entries and any
+        # row that made it to the CSV cache but not the table.
+        self._load_from_csv()
+        log.info("Dedupe set size after merge: %d", len(self._ids))
 
-    def _load(self) -> None:
+    def _load_from_supabase(self, sb: "Client") -> bool:
+        try:
+            ids: set[str] = set()
+            page = 1000
+            offset = 0
+            while True:
+                resp = (
+                    sb.table("jobs")
+                    .select("global_id")
+                    .range(offset, offset + page - 1)
+                    .execute()
+                )
+                rows = resp.data or []
+                ids.update(r["global_id"] for r in rows if r.get("global_id"))
+                if len(rows) < page:
+                    break
+                offset += page
+            self._ids = ids
+            log.info("Loaded %d seen ids from Supabase (jobs table)", len(self._ids))
+            return True
+        except Exception as e:
+            log.warning("Supabase dedupe load failed (%s); falling back to CSV cache", e)
+            return False
+
+    def _load_from_csv(self) -> None:
         if not self.path.exists():
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("w", newline="", encoding="utf-8") as f:
@@ -265,7 +296,7 @@ class SeenStore:
                 gid = (row.get("global_id") or "").strip()
                 if gid:
                     self._ids.add(gid)
-        log.info("Loaded %d seen ids from %s", len(self._ids), self.path)
+        log.info("Loaded %d seen ids from CSV cache %s", len(self._ids), self.path)
 
     def __contains__(self, gid: str) -> bool:
         return gid in self._ids
@@ -605,7 +636,7 @@ def main() -> None:
     args = parser.parse_args()
 
     sb = get_supabase()
-    seen = SeenStore(SEEN_CSV)
+    seen = SeenStore(SEEN_CSV, sb)
     cfg = load_config(CONFIG_DIR, sb)  # one-time startup load just for the boot log
     log.info(
         "Config: %d targets, %d queries, country=%s, seen=%d, supabase=%s, discord=%s, email=%s",

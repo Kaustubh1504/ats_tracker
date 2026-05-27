@@ -16,19 +16,21 @@ If you haven't already, run [supabase_schema.sql](supabase_schema.sql) in the
 Supabase SQL editor. Creates `jobs` and `app_config` tables with permissive
 anon RLS (single-user mode).
 
-## 2. Seed the config table
+## 2. Seed the config + backfill dedupe
 
 Imports your local `config/targets.json` + `config/roles.json` into the
-`app_config` table so the webapp has something to show and the watcher
-has something to fetch.
+`app_config` table, and pre-Supabase `data/seen.csv` rows into the `jobs`
+table. After this:
+
+- Webapp Settings page is the **source of truth** for targets/roles
+- Supabase `jobs` table is the **source of truth** for dedupe
+- Local files become cache/fallback only
 
 ```bash
 set -a; source .env; set +a
-.venv/bin/python scripts/seed_config.py
+.venv/bin/python scripts/seed_config.py    # targets + roles → app_config
+.venv/bin/python scripts/backfill_seen.py  # seen.csv rows → jobs table
 ```
-
-After this, the webapp's `Settings` page is the source of truth — local
-files become a cache/fallback only.
 
 ## 3. Webapp → Vercel
 
@@ -66,6 +68,9 @@ python3.12 -m venv .venv
 # Copy your .env from your laptop or recreate it
 nano .env
 chmod 600 .env
+
+# No need to copy data/seen.csv — Supabase has the dedupe state.
+# The watcher will create an empty CSV cache on first run.
 
 # Smoke-test once (should see "Loaded config from Supabase" in the log)
 set -a; source .env; set +a
