@@ -53,3 +53,29 @@ drop policy if exists "anon update jobs" on public.jobs;
 create policy "anon read jobs"   on public.jobs for select to anon using (true);
 create policy "anon write jobs"  on public.jobs for insert to anon with check (true);
 create policy "anon update jobs" on public.jobs for update to anon using (true) with check (true);
+
+
+-- =========================================================================
+-- app_config: single source of truth for editable runtime config (targets +
+-- roles). Two rows: 'targets' and 'roles'. The watcher fetches both on every
+-- run; webapp edits via the Settings page.
+-- =========================================================================
+create table if not exists public.app_config (
+  id          text primary key,
+  data        jsonb not null,
+  updated_at  timestamptz not null default now()
+);
+
+drop trigger if exists app_config_touch_updated_at on public.app_config;
+create trigger app_config_touch_updated_at before update on public.app_config
+  for each row execute function public.touch_updated_at();
+
+alter table public.app_config enable row level security;
+
+drop policy if exists "anon read config"   on public.app_config;
+drop policy if exists "anon write config"  on public.app_config;
+drop policy if exists "anon update config" on public.app_config;
+
+create policy "anon read config"   on public.app_config for select to anon using (true);
+create policy "anon write config"  on public.app_config for insert to anon with check (true);
+create policy "anon update config" on public.app_config for update to anon using (true) with check (true);

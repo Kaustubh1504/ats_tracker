@@ -108,9 +108,39 @@ def _load_json(path: Path) -> dict:
         sys.exit(f"Invalid JSON in {path}: {e}")
 
 
-def load_config(config_dir: Path) -> Config:
-    targets_doc = _load_json(config_dir / "targets.json")
-    roles_doc = _load_json(config_dir / "roles.json")
+def _fetch_remote_config(sb: "Client | None") -> tuple[dict | None, dict | None]:
+    """Fetch targets + roles JSON from app_config table. Returns (targets, roles) or (None, None)."""
+    if sb is None:
+        return None, None
+    try:
+        resp = sb.table("app_config").select("id, data").in_("id", ["targets", "roles"]).execute()
+    except Exception as e:
+        log.warning("Remote config fetch failed: %s", e)
+        return None, None
+    rows = {r["id"]: r["data"] for r in (resp.data or [])}
+    return rows.get("targets"), rows.get("roles")
+
+
+def _write_local_cache(config_dir: Path, targets_doc: dict, roles_doc: dict) -> None:
+    """Persist whatever config we used this run as the offline fallback."""
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "targets.json").write_text(json.dumps(targets_doc, indent=2))
+        (config_dir / "roles.json").write_text(json.dumps(roles_doc, indent=2))
+    except OSError as e:
+        log.warning("Couldn't cache config to %s: %s", config_dir, e)
+
+
+def load_config(config_dir: Path, sb: "Client | None" = None) -> Config:
+    remote_targets, remote_roles = _fetch_remote_config(sb)
+    if remote_targets is not None and remote_roles is not None:
+        targets_doc, roles_doc = remote_targets, remote_roles
+        log.info("Loaded config from Supabase (app_config table).")
+        _write_local_cache(config_dir, targets_doc, roles_doc)
+    else:
+        targets_doc = _load_json(config_dir / "targets.json")
+        roles_doc = _load_json(config_dir / "roles.json")
+        log.info("Loaded config from local files (Supabase unavailable or empty).")
 
     targets: list[Target] = []
     for i, entry in enumerate(targets_doc.get("targets") or []):
@@ -376,41 +406,34 @@ def send_email_summary(source: str, new_rows: list[dict]) -> None:
         return
 
     count = len(new_rows)
-    rows_html = []
-    for r in new_rows[:50]:
-        company = (r.get("company") or "?")[:60]
-        title = (r.get("title") or "Untitled")[:120]
-        location = (r.get("location") or "")[:80]
-        url = str(r.get("apply_url") or r.get("url") or "")
-        title_cell = f'<a href="{url}" style="color:#2563eb;text-decoration:none">{title}</a>' if url else title
-        rows_html.append(
-            f'<tr>'
-            f'<td style="padding:6px 10px;border-bottom:1px solid #eee;font-weight:500">{company}</td>'
-            f'<td style="padding:6px 10px;border-bottom:1px solid #eee">{title_cell}</td>'
-            f'<td style="padding:6px 10px;border-bottom:1px solid #eee;color:#666;font-size:13px">{location}</td>'
-            f'</tr>'
-        )
-    extra = f"<p style='color:#666;font-size:13px'>…and {count - 50} more (open the dashboard)</p>" if count > 50 else ""
+
+    # Per-company tally — sorted by count desc, then company asc.
+    per_company: dict[str, int] = {}
+    for r in new_rows:
+        co = (r.get("company") or "Unknown").strip() or "Unknown"
+        per_company[co] = per_company.get(co, 0) + 1
+    company_breakdown = sorted(per_company.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+
+    breakdown_html = "".join(
+        f'<tr>'
+        f'<td style="padding:6px 12px;border-bottom:1px solid #f0f0f0;font-weight:500">{co}</td>'
+        f'<td style="padding:6px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#666;font-variant-numeric:tabular-nums">{n}</td>'
+        f'</tr>'
+        for co, n in company_breakdown
+    )
+
     dashboard_link = f'<p><a href="{WEBAPP_URL}" style="color:#2563eb">Open dashboard →</a></p>' if WEBAPP_URL else ""
 
     body_html = f"""
-    <div style="font-family:-apple-system,system-ui,sans-serif;max-width:720px;margin:0 auto">
+    <div style="font-family:-apple-system,system-ui,sans-serif;max-width:560px;margin:0 auto">
       <h2 style="margin-bottom:4px">{count} new internship{'s' if count != 1 else ''}</h2>
-      <p style="color:#666;margin-top:0">source: <code>{source}</code></p>
+      <p style="color:#666;margin-top:0">source: <code>{source}</code> · {len(company_breakdown)} compan{'ies' if len(company_breakdown) != 1 else 'y'}</p>
       {dashboard_link}
       <table style="border-collapse:collapse;width:100%;margin-top:12px;font-size:14px">
-        <thead>
-          <tr style="background:#f5f5f7">
-            <th style="padding:8px 10px;text-align:left;border-bottom:2px solid #ddd">Company</th>
-            <th style="padding:8px 10px;text-align:left;border-bottom:2px solid #ddd">Title</th>
-            <th style="padding:8px 10px;text-align:left;border-bottom:2px solid #ddd">Location</th>
-          </tr>
-        </thead>
         <tbody>
-          {''.join(rows_html)}
+          {breakdown_html}
         </tbody>
       </table>
-      {extra}
     </div>
     """
 
@@ -499,7 +522,9 @@ def _fetch_one_target(t: Target) -> tuple[Target, list[dict], Exception | None, 
     return (t, out, None, time.monotonic() - start)
 
 
-def live_check(cfg: Config, seen: SeenStore, sb: Client | None) -> None:
+def live_check(seen: SeenStore, sb: Client | None, cfg: Config | None = None) -> None:
+    if cfg is None:
+        cfg = load_config(CONFIG_DIR, sb)
     live_log.info("Live scrape of %d targets (workers=%d)…", len(cfg.targets), SCRAPE_WORKERS)
     rows: list[dict] = []
     failed = 0
@@ -536,7 +561,9 @@ def live_check(cfg: Config, seen: SeenStore, sb: Client | None) -> None:
     send_run_summary("live", new_rows)
 
 
-def dataset_check(cfg: Config, seen: SeenStore, sb: Client | None) -> None:
+def dataset_check(seen: SeenStore, sb: Client | None, cfg: Config | None = None) -> None:
+    if cfg is None:
+        cfg = load_config(CONFIG_DIR, sb)
     ds_log.info("Dataset sweep across %d queries…", len(cfg.dataset_queries))
     location_hint = "United States" if cfg.country == "US" else None
     by_id: dict[str, dict] = {}
@@ -577,9 +604,9 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="Both passes once, then exit")
     args = parser.parse_args()
 
-    cfg = load_config(CONFIG_DIR)
-    seen = SeenStore(SEEN_CSV)
     sb = get_supabase()
+    seen = SeenStore(SEEN_CSV)
+    cfg = load_config(CONFIG_DIR, sb)  # one-time startup load just for the boot log
     log.info(
         "Config: %d targets, %d queries, country=%s, seen=%d, supabase=%s, discord=%s, email=%s",
         len(cfg.targets), len(cfg.dataset_queries), cfg.country, len(seen._ids),
@@ -589,19 +616,21 @@ def main() -> None:
     )
 
     if args.once_live:
-        live_check(cfg, seen, sb); return
+        live_check(seen, sb, cfg); return
     if args.once_dataset:
-        dataset_check(cfg, seen, sb); return
+        dataset_check(seen, sb, cfg); return
     if args.once:
-        live_check(cfg, seen, sb); dataset_check(cfg, seen, sb); return
+        live_check(seen, sb, cfg); dataset_check(seen, sb, cfg); return
 
-    live_check(cfg, seen, sb)
-    dataset_check(cfg, seen, sb)
+    # Long-running mode: each scheduled tick reloads config so webapp edits
+    # take effect on the next run without restarting the service.
+    live_check(seen, sb, cfg)
+    dataset_check(seen, sb, cfg)
 
     scheduler = BlockingScheduler(timezone="UTC")
-    scheduler.add_job(lambda: live_check(cfg, seen, sb),    "interval",
+    scheduler.add_job(lambda: live_check(seen, sb),    "interval",
                       minutes=LIVE_POLL_MINUTES,  max_instances=1, id="live")
-    scheduler.add_job(lambda: dataset_check(cfg, seen, sb), "interval",
+    scheduler.add_job(lambda: dataset_check(seen, sb), "interval",
                       hours=DATASET_POLL_HOURS,   max_instances=1, id="dataset")
     log.info(
         "Scheduler started — live every %d min, dataset every %d h. Ctrl-C to quit.",

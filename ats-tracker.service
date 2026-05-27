@@ -1,0 +1,24 @@
+[Unit]
+Description=ATS Tracker — internship watcher (long-running APScheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/ats_tracker
+EnvironmentFile=/home/pi/ats_tracker/.env
+ExecStart=/home/pi/ats_tracker/.venv/bin/python watcher.py
+Restart=always
+RestartSec=30
+# Restart with backoff on rapid-fail loops (5 failures within 5 minutes = stop trying)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# Avoid SD-card thrash from journald
+StandardOutput=journal
+StandardError=journal
+# Memory cap so a runaway scraper doesn't OOM the Pi
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target
