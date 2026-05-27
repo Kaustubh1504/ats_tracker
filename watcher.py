@@ -558,41 +558,61 @@ def _fetch_one_target(t: Target) -> tuple[Target, list[dict], Exception | None, 
     return (t, out, None, time.monotonic() - start)
 
 
+def _merge_counts(into: dict, other: dict) -> None:
+    for k, v in other.items():
+        into[k] = into.get(k, 0) + v
+
+
 def live_check(seen: SeenStore, sb: Client | None, cfg: Config | None = None) -> None:
     if cfg is None:
         cfg = load_config(CONFIG_DIR, sb)
     live_log.info("Live scrape of %d targets (workers=%d)…", len(cfg.targets), SCRAPE_WORKERS)
-    rows: list[dict] = []
+    counts = {"posted": 0, "seen": 0, "non_country": 0,
+              "no_intern": 0, "blocked": 0, "no_title": 0}
+    new_rows: list[dict] = []
     failed = 0
+    total_candidates = 0
+    completed = 0
+    total = len(cfg.targets)
     started = time.monotonic()
 
     with ThreadPoolExecutor(max_workers=SCRAPE_WORKERS) as ex:
         futures = {ex.submit(_fetch_one_target, t): t for t in cfg.targets}
         for fut in as_completed(futures):
             t = futures[fut]
+            completed += 1
             try:
                 _, target_rows, err, elapsed = fut.result(timeout=SCRAPE_TIMEOUT_SEC)
             except Exception as e:
-                live_log.warning("%s/%s timed out or crashed: %s", t.ats, t.slug, e)
+                live_log.warning("[%d/%d] %s/%s timed out or crashed: %s", completed, total, t.ats, t.slug, e)
                 failed += 1
                 continue
             if err is not None:
-                live_log.warning("%s/%s scraper failed in %.1fs: %s", t.ats, t.slug, elapsed, err)
+                live_log.warning("[%d/%d] %s/%s scraper failed in %.1fs: %s", completed, total, t.ats, t.slug, elapsed, err)
                 failed += 1
                 continue
-            rows.extend(target_rows)
-            if elapsed > 30:
-                live_log.info("%s/%s slow: %.1fs, %d jobs", t.ats, t.slug, elapsed, len(target_rows))
+
+            # Process this target's rows immediately so Supabase + seen.csv
+            # get updated incrementally rather than all at the end.
+            total_candidates += len(target_rows)
+            c, nr = process_rows(target_rows, "live", seen, cfg, sb)
+            _merge_counts(counts, c)
+            new_rows.extend(nr)
+
+            if c["posted"] > 0 or elapsed > 30:
+                live_log.info(
+                    "[%d/%d] %s/%s: %d candidates → %d posted (%.1fs)",
+                    completed, total, t.ats, t.slug, len(target_rows), c["posted"], elapsed,
+                )
 
     live_log.info(
-        "Collected %d candidate rows from %d targets (%d failed) in %.1fs",
-        len(rows), len(cfg.targets) - failed, failed, time.monotonic() - started,
+        "Live done: %d candidates from %d targets (%d failed) in %.1fs",
+        total_candidates, total - failed, failed, time.monotonic() - started,
     )
-    c, new_rows = process_rows(rows, "live", seen, cfg, sb)
     live_log.info(
         "Posted %d  (seen=%d, non-%s=%d, no_intern=%d, blocked=%d, no_title=%d)",
-        c["posted"], c["seen"], cfg.country, c["non_country"],
-        c["no_intern"], c["blocked"], c["no_title"],
+        counts["posted"], counts["seen"], cfg.country, counts["non_country"],
+        counts["no_intern"], counts["blocked"], counts["no_title"],
     )
     send_run_summary("live", new_rows)
 
@@ -602,29 +622,39 @@ def dataset_check(seen: SeenStore, sb: Client | None, cfg: Config | None = None)
         cfg = load_config(CONFIG_DIR, sb)
     ds_log.info("Dataset sweep across %d queries…", len(cfg.dataset_queries))
     location_hint = "United States" if cfg.country == "US" else None
-    by_id: dict[str, dict] = {}
-    for query in cfg.dataset_queries:
+    counts = {"posted": 0, "seen": 0, "non_country": 0,
+              "no_intern": 0, "blocked": 0, "no_title": 0}
+    new_rows: list[dict] = []
+    total_candidates = 0
+
+    for i, query in enumerate(cfg.dataset_queries, 1):
         try:
             kwargs = {"query": query}
             if location_hint:
                 kwargs["location"] = location_hint
             df = search(**kwargs)
         except Exception as e:
-            ds_log.warning("search(%r) failed: %s", query, e)
+            ds_log.warning("[%d/%d] search(%r) failed: %s", i, len(cfg.dataset_queries), query, e)
             continue
         if df is None or len(df) == 0:
             continue
-        for row in df.to_dict(orient="records"):
-            gid = row.get("global_id")
-            if gid:
-                by_id.setdefault(gid, row)
 
-    ds_log.info("Collected %d unique candidate rows", len(by_id))
-    c, new_rows = process_rows(list(by_id.values()), "dataset", seen, cfg, sb)
+        # Process each query's results immediately. process_rows already
+        # dedupes via `seen`, so jobs returned by multiple queries are
+        # written only once.
+        query_rows = df.to_dict(orient="records")
+        total_candidates += len(query_rows)
+        c, nr = process_rows(query_rows, "dataset", seen, cfg, sb)
+        _merge_counts(counts, c)
+        new_rows.extend(nr)
+        if c["posted"] > 0:
+            ds_log.info("[%d/%d] %r → %d posted", i, len(cfg.dataset_queries), query, c["posted"])
+
+    ds_log.info("Dataset done: %d candidate rows across %d queries", total_candidates, len(cfg.dataset_queries))
     ds_log.info(
         "Posted %d  (seen=%d, non-%s=%d, no_intern=%d, blocked=%d, no_title=%d)",
-        c["posted"], c["seen"], cfg.country, c["non_country"],
-        c["no_intern"], c["blocked"], c["no_title"],
+        counts["posted"], counts["seen"], cfg.country, counts["non_country"],
+        counts["no_intern"], counts["blocked"], counts["no_title"],
     )
     send_run_summary("dataset", new_rows)
 
