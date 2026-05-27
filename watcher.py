@@ -538,10 +538,15 @@ def process_rows(
 # =========================================================================== #
 
 def _fetch_one_target(t: Target) -> tuple[Target, list[dict], Exception | None, float]:
-    """Fetch a single target. Runs inside a worker thread."""
+    """Fetch a single target. Runs inside a worker thread. For Workday tenants
+    we pass max_fetch_seconds so the scraper self-terminates instead of
+    blocking the worker indefinitely (Future timeouts don't kill threads)."""
     start = time.monotonic()
+    kwargs: dict = {}
+    if t.ats == "workday":
+        kwargs["max_fetch_seconds"] = SCRAPE_TIMEOUT_SEC
     try:
-        jobs = get_scraper(t.ats, t.slug).fetch()
+        jobs = get_scraper(t.ats, t.slug, **kwargs).fetch()
     except Exception as e:
         return (t, [], e, time.monotonic() - start)
     out: list[dict] = []
